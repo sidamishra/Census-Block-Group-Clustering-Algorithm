@@ -1,0 +1,519 @@
+\documentclass[11pt]{article}
+\usepackage[margin=1in]{geometry}
+\usepackage{amsmath,amssymb,amsthm}
+\usepackage{booktabs,longtable}
+\usepackage{bm}
+
+\newcommand{\R}{\mathbb{R}}
+\newcommand{\x}{\mathbf{x}}
+\newcommand{\bmu}{\boldsymbol{\mu}}
+\newcommand{\argmin}{\mathop{\operatorname{arg\,min}}}
+\newcommand{\clip}{\operatorname{clip}}
+\newcommand{\med}{\operatorname{med}}
+\newcommand{\Var}{\operatorname{Var}}
+\newcommand{\st}{\operatorname{st}}
+\newcommand{\ft}[1]{\texttt{\detokenize{#1}}}
+
+\newtheorem*{prop}{Proposition}
+
+\title{K-means formulation of the block-group clustering\\
+\large (\texttt{standardize.py} + \texttt{cluster.py}, default settings)}
+\date{}
+
+\begin{document}
+\maketitle
+
+\section{The textbook objective}
+
+Given observations $\x_1,\dots,\x_n\in\R^d$, k-means seeks
+\begin{equation}
+\argmin_{\mathbf S}\sum_{i=1}^{k}\sum_{\x\in S_i}\bigl\|\x-\bmu_i\bigr\|^2
+=\argmin_{\mathbf S}\sum_{i=1}^{k}|S_i|\Var S_i,
+\qquad
+\bmu_i=\frac{1}{|S_i|}\sum_{\x\in S_i}\x .
+\label{eq:wiki}
+\end{equation}
+The rest of this document defines exactly what $n$, $d$, $\x$, $\bmu_i$ and
+$\|\cdot\|$ are in our pipeline.
+
+%======================================================================
+\section{Index sets}
+
+\begin{itemize}
+\item $\mathcal B$: all 2020 Census block groups (BGs) in the ACS 2019--23 universe,
+  50 states + DC; $|\mathcal B| = 239{,}741$. Each $b\in\mathcal B$ has a 12-character GEOID;
+  $\st(b)$ is its first 2 characters (state FIPS).
+\item Row filter (the \emph{fit set}):
+  \[
+  \mathcal F=\{\,b\in\mathcal B:\ \mathrm{pop}_b\ge 50\ \text{and}\ \mathrm{households}_b>0\,\},
+  \qquad |\mathcal F| = 236{,}829 .
+  \]
+\item Region $R$ (a set of state FIPS codes chosen with \texttt{--states}):
+  \[
+  \mathcal B_R=\{\,b\in\mathcal F:\ \st(b)\in R\,\},\qquad n=|\mathcal B_R| .
+  \]
+  For $R=\{09,34,36\}$ (CT, NJ, NY): $n=24{,}680$.
+\item Features $\mathcal J$, $d=|\mathcal J|=42$ (Table~\ref{tab:features}).
+\item Concepts $\mathcal G$, $|\mathcal G|=15$: each feature belongs to exactly one concept
+  $g(j)\in\mathcal G$; $n_g=|\{j:g(j)=g\}|$ is the concept's column count.
+\item $\mathcal E=\{\ft{ecef_x_km},\ft{ecef_y_km},\ft{ecef_z_km}\}\subset\mathcal J$ is the
+  \emph{distance} concept ($n_{\text{distance}}=3$).
+\item Pooled-scale blocks
+  $\mathcal P=\{\mathcal E,K_{\text{race}},K_{\text{units}},K_{\text{lang}},K_{\text{occ}}\}$:
+  disjoint sets of columns that share one scale (Steps 3--4). $K_{\text{race}}$ is the 7 race
+  shares, $K_{\text{units}}$ the 6 home-type shares, $K_{\text{lang}}$ the 5 tract
+  language shares (not \ft{lep_hh_share}), and $K_{\text{occ}}$ the 5 occupation shares. Every
+  other feature is scaled on its own.
+\end{itemize}
+
+%======================================================================
+\section{Constructing $\x_b$}
+
+\subsection{Step 0: raw values}
+
+$r_{b,j}$ is the raw value of feature $j$ for BG $b$ (possibly missing). The three distance
+features are Earth-Centered Earth-Fixed coordinates of the BG's population-weighted center
+(latitude $\varphi_b$, longitude $\lambda_b$; TIGER internal point as fallback) on the WGS84
+ellipsoid at height $0$:
+\begin{gather*}
+a = 6378.137\ \text{km},\qquad f=\tfrac{1}{298.257223563},\qquad e^2=f(2-f),\qquad
+N(\varphi)=\frac{a}{\sqrt{1-e^2\sin^2\varphi}},\\[4pt]
+\mathbf p_b=\begin{pmatrix} r_{b,\mathrm{x}}\\ r_{b,\mathrm{y}}\\ r_{b,\mathrm{z}}\end{pmatrix}
+=\begin{pmatrix}
+N(\varphi_b)\cos\varphi_b\cos\lambda_b\\
+N(\varphi_b)\cos\varphi_b\sin\lambda_b\\
+N(\varphi_b)\,(1-e^2)\sin\varphi_b
+\end{pmatrix}\ \text{km}.
+\end{gather*}
+
+\subsection{Step 1: per-feature transform}
+
+With $\clip(v;\ell,u)=\min(\max(v,\ell),u)$,
+\[
+t_{b,j}=T_j(r_{b,j}),\qquad
+T_j(v)=\begin{cases}
+v & \text{none}\\[2pt]
+\ln\!\bigl(1+\max(v,0)\bigr) & \text{log1p}\\[2pt]
+\clip(v;\ell_j,u_j) & \text{winsor}\\[2pt]
+\ln\!\bigl(1+\max(\clip(v;\ell_j,u_j),0)\bigr) & \text{winsor\_log1p}
+\end{cases}
+\]
+The winsor bounds are empirical quantiles of the observed raw values over the national fit
+set,
+\[
+\ell_j=\widehat Q_{\mathcal F}\!\bigl(r_{\cdot,j};\,p^{\mathrm{lo}}_j\bigr),\qquad
+u_j=\widehat Q_{\mathcal F}\!\bigl(r_{\cdot,j};\,p^{\mathrm{hi}}_j\bigr),\qquad
+(p^{\mathrm{lo}}_j,p^{\mathrm{hi}}_j)=\begin{cases}(0.020,\,0.995) & j=\ft{violent_crime_rate}\\
+(0.005,\,0.995) & \text{otherwise.}\end{cases}
+\]
+Fitted values are listed in Table~\ref{tab:features}.
+
+\subsection{Step 2: hierarchical median imputation}
+
+Let $O_j\subseteq\mathcal F$ be the BGs where $t_{b,j}$ is observed. For a BG $b$ define nested
+geographic neighbourhoods by GEOID prefix,
+\[
+A_L(b)=\{\,b'\in\mathcal F:\ \mathrm{GEOID}_{b'}[{:}\kappa_L]=\mathrm{GEOID}_b[{:}\kappa_L]\,\},
+\qquad (\kappa_{\text{tract}},\kappa_{\text{county}},\kappa_{\text{state}},\kappa_{\text{nation}})=(11,5,2,0).
+\]
+For a scalar feature,
+\[
+\tilde t_{b,j}=\begin{cases}
+t_{b,j} & b\in O_j\\
+\med\{\,t_{b',j}: b'\in A_{L^*}(b)\cap O_j\,\} & b\notin O_j,
+\end{cases}
+\]
+where $L^*$ is the first level in (tract, county, state, nation) whose donor set
+$A_L(b)\cap O_j$ is non-empty.
+
+\emph{Compositional blocks} $K\in\{$race (7), home type (6), tract language (5), occupation
+(5)$\}$ are imputed all-or-nothing: if any share in $K$ is missing for $b$, the whole vector is
+replaced. Donors are BGs whose block is complete, $O_K=\bigcap_{j\in K}O_j$, and
+\[
+\mathbf m_K(b)=\bigl(\med\{t_{b',j}:b'\in A_{L^*}(b)\cap O_K\}\bigr)_{j\in K},\qquad
+\tilde t_{b,j}=\frac{m_{K,j}(b)}{\sum_{j'\in K}m_{K,j'}(b)}\quad(j\in K),
+\]
+so imputed shares still sum to 1. ($\ft{lep_hh_share}$ is in the language concept but not in
+the tract-language block, so it is imputed as a scalar.)
+
+\subsection{Step 3: national standardization (\texttt{features\_standardized.parquet})}
+
+Population moments over the fit set ($\mathrm{ddof}=0$):
+\[
+m_j=\frac{1}{|\mathcal F|}\sum_{b\in\mathcal F}\tilde t_{b,j},\qquad
+s_j=\Bigl(\frac{1}{|\mathcal F|}\sum_{b\in\mathcal F}(\tilde t_{b,j}-m_j)^2\Bigr)^{1/2}.
+\]
+Each column of a pooled-scale block $P\in\mathcal P$ is centered on its own mean, but all
+columns of the block are divided by one shared scale: the root-mean of the block's column
+variances.
+\[
+s_P=\Bigl(\frac{1}{|P|}\sum_{j\in P}s_j^2\Bigr)^{1/2},\qquad
+s_{[j]}=\begin{cases}s_P & j\in P\in\mathcal P\\ s_j & \text{otherwise,}\end{cases}\qquad
+z_{b,j}=\frac{\tilde t_{b,j}-m_j}{s_{[j]}} .
+\]
+Fitted values: $s_{\mathcal E}=862.33$ km, $s_{K_{\text{race}}}=0.1736$,
+$s_{K_{\text{units}}}=0.1816$, $s_{K_{\text{lang}}}=0.1305$, $s_{K_{\text{occ}}}=0.1283$.
+Each block keeps total variance $\sum_{j\in P}\Var(z_{\cdot,j})=|P|$, the same as $|P|$
+separately z-scored features. Within the block, that variance is split among the columns in
+proportion to each category's actual spread.
+
+\subsection{Step 4: regional re-standardization (\texttt{--scale regional}, default)}
+
+Restrict to $\mathcal B_R$ and standardize again, using regional moments:
+\[
+\bar z^R_j=\frac1n\sum_{b\in\mathcal B_R}z_{b,j},\qquad
+\sigma^R_j=\Bigl(\frac1n\sum_{b\in\mathcal B_R}(z_{b,j}-\bar z^R_j)^2\Bigr)^{1/2},\qquad
+\sigma^R_P=\Bigl(\frac{1}{|P|}\sum_{j\in P}(\sigma^R_j)^2\Bigr)^{1/2}\quad(P\in\mathcal P),
+\]
+\[
+\check z_{b,j}=\begin{cases}
+(z_{b,j}-\bar z^R_j)/\sigma^R_P & j\in P\in\mathcal P\\[2pt]
+(z_{b,j}-\bar z^R_j)/\sigma^R_j & \text{otherwise, }\sigma^R_j>0\\[2pt]
+z_{b,j}-\bar z^R_j\ (=0) & \text{otherwise, }\sigma^R_j=0 .
+\end{cases}
+\]
+
+\begin{prop}[the national step cancels]
+Because Step 3 is an affine map with positive slope, Step 4 equals standardizing the imputed,
+transformed values directly within the region, using the same pooled blocks. Write
+$\bar t^R_j$ and $\tau^R_j$ for the regional mean and population s.d.\ of $\tilde t_{\cdot,j}$,
+and define the \emph{effective regional scale}
+\[
+\tau^R_{[j]}=\begin{cases}
+\tau^R_P=\Bigl(\dfrac{1}{|P|}\sum_{j'\in P}(\tau^R_{j'})^2\Bigr)^{1/2} & j\in P\in\mathcal P\\[10pt]
+\tau^R_j & \text{otherwise.}
+\end{cases}
+\]
+Then
+\[
+\check z_{b,j}=\frac{\tilde t_{b,j}-\bar t^R_j}{\tau^R_{[j]}}\quad\forall j,
+\qquad\text{in particular}\qquad
+\begin{pmatrix}\check z_{b,\mathrm{x}}\\\check z_{b,\mathrm{y}}\\\check z_{b,\mathrm{z}}\end{pmatrix}
+=\frac{\mathbf p_b-\bar{\mathbf p}^R}{\tau^R_{\mathcal E}},\quad
+\tau^R_{\mathcal E}=\Bigl(\tfrac13\sum_{a\in\{\mathrm{x,y,z}\}}\Var_{\mathcal B_R}(p_{\cdot,a})\Bigr)^{1/2}.
+\]
+For $R=\{09,34,36\}$: $\tau^R_{\mathcal E}=94.88$ km (per-axis s.d.\ 126.6, 63.3, 83.5 km),
+$\tau^R_{K_{\text{race}}}=0.1764$, $\tau^R_{K_{\text{units}}}=0.2219$,
+$\tau^R_{K_{\text{lang}}}=0.1416$, $\tau^R_{K_{\text{occ}}}=0.1280$.
+\end{prop}
+\begin{proof}
+For every $j$, $z_{b,j}=(\tilde t_{b,j}-m_j)/s_{[j]}$, so $\bar z^R_j=(\bar t^R_j-m_j)/s_{[j]}$ and
+$\sigma^R_j=\tau^R_j/s_{[j]}$. Within a block $P$ the divisor $s_{[j]}=s_P$ is common, so
+$\sigma^R_P=\tau^R_P/s_P$. Substituting gives the result.
+\end{proof}
+
+With \texttt{--scale national} instead, $\check z_{b,j}=z_{b,j}$ (no Step 4). Everything below
+still holds with $(\bar t^R_j,\tau^R_{[j]})$ replaced by $(m_j,s_{[j]})$, except the
+equal-contribution result of Section~\ref{sec:contrib}.
+
+\subsection{Step 5: concept weights}
+
+\[
+w_j=\frac{c_{g(j)}}{\sqrt{n_{g(j)}}},\qquad c_g=1\ \ \forall g\in\mathcal G
+\quad(\texttt{CONCEPT\_WEIGHTS}),\qquad
+W=\operatorname{diag}(w_1,\dots,w_{42}).
+\]
+So $w_j=1$ for single-column concepts, $1/\sqrt2\approx0.7071$ for 2-column concepts,
+$1/\sqrt3\approx0.5774$, $1/\sqrt5\approx0.4472$, $1/\sqrt6\approx0.4082$,
+$1/\sqrt7\approx0.3780$.
+
+\subsection{Step 6: the observation vector}
+
+\[
+\boxed{\;\x_b=W\check{\mathbf z}_b\in\R^{42},\qquad
+x_{b,j}=w_j\,\check z_{b,j}=
+\begin{cases}
+\dfrac{c_{\text{distance}}}{\sqrt3}\cdot\dfrac{p_{b,a(j)}-\bar p^R_{a(j)}}{\tau^R_{\mathcal E}} & j\in\mathcal E\\[12pt]
+\dfrac{c_{g(j)}}{\sqrt{n_{g(j)}}}\cdot\dfrac{\tilde t_{b,j}-\bar t^R_j}{\tau^R_{[j]}} & j\notin\mathcal E
+\end{cases}\;}
+\]
+where $a(j)\in\{\mathrm x,\mathrm y,\mathrm z\}$ is the ECEF axis of feature $j$, and
+$\tau^R_{[j]}$ is the block-pooled scale for share columns and the feature's own s.d.\
+otherwise.
+
+%======================================================================
+\section{The objective with our definitions substituted}
+
+The observations are $\{\x_b\}_{b\in\mathcal B_R}$, $n=|\mathcal B_R|$, $d=42$, $k$ from
+\texttt{--k} (default 5). The partition is $\mathbf S=\{S_1,\dots,S_k\}$ of $\mathcal B_R$.
+
+\paragraph{Centroids.} Since $\x_b$ is linear in $\check{\mathbf z}_b$ and in $\tilde{\mathbf t}_b$,
+\[
+\bmu_i=\frac1{|S_i|}\sum_{b\in S_i}\x_b=W\bar{\check{\mathbf z}}_{i},\qquad
+\mu_{i,j}=\begin{cases}
+\dfrac{c_{\text{distance}}}{\sqrt3}\cdot\dfrac{\bar p_{i,a(j)}-\bar p^R_{a(j)}}{\tau^R_{\mathcal E}} & j\in\mathcal E\\[12pt]
+\dfrac{c_{g(j)}}{\sqrt{n_{g(j)}}}\cdot\dfrac{\bar t_{i,j}-\bar t^R_j}{\tau^R_{[j]}} & j\notin\mathcal E
+\end{cases}
+\]
+with $\bar{\mathbf p}_i=\frac1{|S_i|}\sum_{b\in S_i}\mathbf p_b$ (the cluster's mean ECEF point)
+and $\bar t_{i,j}=\frac1{|S_i|}\sum_{b\in S_i}\tilde t_{b,j}$.
+(\texttt{centroids\_z.csv} reports $W^{-1}\bmu_i=\bar{\check{\mathbf z}}_i$.)
+
+\paragraph{Objective.} Substituting into \eqref{eq:wiki}, the regional means cancel inside
+$x_{b,j}-\mu_{i,j}$, leaving
+\begin{align}
+&\argmin_{\mathbf S}\sum_{i=1}^{k}\sum_{b\in S_i}\bigl\|\x_b-\bmu_i\bigr\|^2 \notag\\
+&\quad=\argmin_{\mathbf S}\sum_{i=1}^{k}\sum_{b\in S_i}\sum_{g\in\mathcal G}\frac{c_g^2}{n_g}
+\sum_{j:\,g(j)=g}\bigl(\check z_{b,j}-\bar{\check z}_{i,j}\bigr)^2 \notag\\
+&\quad=\argmin_{\mathbf S}\sum_{i=1}^{k}\sum_{b\in S_i}\Biggl[
+\frac{c_{\text{distance}}^2}{3\,(\tau^R_{\mathcal E})^2}\,\bigl\|\mathbf p_b-\bar{\mathbf p}_i\bigr\|_2^2
++\sum_{g\neq\text{distance}}\frac{c_g^2}{n_g}\sum_{j:\,g(j)=g}
+\Bigl(\frac{\tilde t_{b,j}-\bar t_{i,j}}{\tau^R_{[j]}}\Bigr)^2\Biggr] \label{eq:obj}\\
+&\quad=\argmin_{\mathbf S}\sum_{i=1}^{k}|S_i|\Var S_i,\qquad
+\Var S_i=\frac1{|S_i|}\sum_{b\in S_i}\|\x_b-\bmu_i\|^2=\sum_{j=1}^{42}w_j^2\,\Var_{S_i}\!\bigl(\check z_{\cdot,j}\bigr). \notag
+\end{align}
+The first term is $\tfrac{1}{3(\tau^R_{\mathcal E})^2}$ times the sum of squared straight-line
+(km) distances from each BG's ECEF point to its cluster's mean ECEF point.
+
+\paragraph{Pairwise form.} Using
+$\sum_{\x\in S}\|\x-\bmu\|^2=\frac{1}{2|S|}\sum_{\x,\mathbf y\in S}\|\x-\mathbf y\|^2$,
+the same objective is
+\[
+\argmin_{\mathbf S}\sum_{i=1}^{k}\frac{1}{2|S_i|}\sum_{b\in S_i}\sum_{b'\in S_i}D^2(b,b'),
+\]
+with the pairwise distance $D$ defined next.
+
+%======================================================================
+\section{The distance function}
+
+\subsection{General form}
+
+\[
+D(b,b')=\|\x_b-\x_{b'}\|_2,\qquad
+D^2(b,b')=\sum_{j=1}^{42}w_j^2\bigl(\check z_{b,j}-\check z_{b',j}\bigr)^2
+=\bigl(\tilde{\mathbf t}_b-\tilde{\mathbf t}_{b'}\bigr)^{\!\top}\Lambda\,\bigl(\tilde{\mathbf t}_b-\tilde{\mathbf t}_{b'}\bigr),
+\]
+\[
+\Lambda=\operatorname{diag}\!\Bigl(\frac{w_j^2}{(\tau^R_{[j]})^2}\Bigr)_{j=1}^{42}.
+\]
+So $D$ is a \emph{diagonally weighted Euclidean distance} on the transformed, imputed features
+$\tilde{\mathbf t}$. Each squared feature difference is divided by its concept's column count
+and by a regional variance: the feature's own, or the block's pooled variance for ECEF
+coordinates and share columns. Because whole blocks share one divisor, $\Lambda$ is not the
+inverse of the diagonal of the covariance matrix, so $D$ is not a diagonal Mahalanobis
+distance. There are no off-diagonal terms, so correlations between features are not adjusted
+for.
+
+\subsection{Decomposition by concept}
+
+\[
+D^2(b,b')=\sum_{g\in\mathcal G}\Delta^2_g(b,b'),\qquad
+\Delta^2_g(b,b')=\frac{c_g^2}{n_g}\sum_{j:\,g(j)=g}\Bigl(\frac{\tilde t_{b,j}-\tilde t_{b',j}}{\tau^R_{[j]}}\Bigr)^2 .
+\]
+The terms below are written out with all $c_g=1$, using this notation:
+\begin{itemize}
+\item the superscript $R$ is dropped on $\tau$;
+\item $\boldsymbol\pi^{K}_b$ is BG $b$'s share vector for block $K$, and $\pi$ on its own is a
+  single share;
+\item $\tau_K$ is the block's pooled regional scale;
+\item $C(v)=\clip(v;\ell_j,u_j)$, using the bounds of the feature it is applied to.
+\end{itemize}
+\begin{align*}
+\Delta^2_{\text{distance}}&=\frac{\|\mathbf p_b-\mathbf p_{b'}\|_2^2}{3\,\tau_{\mathcal E}^2}
+ =\frac{\bigl(\text{chord}_{bb'}\ \text{km}\bigr)^2}{3\,\tau_{\mathcal E}^2}\\
+\Delta^2_{\text{race}}&=\frac{\bigl\|\boldsymbol\pi^{\text{race}}_b-\boldsymbol\pi^{\text{race}}_{b'}\bigr\|_2^2}{7\,\tau_{K_{\text{race}}}^2}
+ =\frac{1}{7\,\tau_{K_{\text{race}}}^2}\sum_{q\in\{\text{wht,blk,aian,asn,nhpi,oth,hisp}\}}
+ \bigl(\pi^{\text{race}}_{b,q}-\pi^{\text{race}}_{b',q}\bigr)^2\\
+\Delta^2_{\text{density}}&=\frac{1}{\tau_{\rho}^2}\Bigl(\ln\frac{1+\rho_b}{1+\rho_{b'}}\Bigr)^2
+ \qquad(\rho=\text{people per km}^2)\\
+\Delta^2_{\text{language}}&=\frac16\Biggl[
+ \frac{\bigl\|\boldsymbol\pi^{\text{lang}}_b-\boldsymbol\pi^{\text{lang}}_{b'}\bigr\|_2^2}{\tau_{K_{\text{lang}}}^2}
+ +\Bigl(\frac{\pi^{\text{LEP}}_b-\pi^{\text{LEP}}_{b'}}{\tau_{\text{LEP}}}\Bigr)^2\Biggr]
+ \qquad(\boldsymbol\pi^{\text{lang}}\in\R^5:\ \text{eng, spa, ie, api, oth})\\
+\Delta^2_{\text{age}}&=\Bigl(\frac{\text{age}_b-\text{age}_{b'}}{\tau_{\text{age}}}\Bigr)^2\\
+\Delta^2_{\text{income}}&=\frac{1}{\tau_I^2}\Bigl(\ln\frac{1+I_b}{1+I_{b'}}\Bigr)^2
+ \qquad(I=\text{median household income, \$})\\
+\Delta^2_{\text{dependents}}&=\frac13\Biggl[
+ \Bigl(\frac{\pi^{\text{kids}}_b-\pi^{\text{kids}}_{b'}}{\tau_{\text{kids}}}\Bigr)^2
+ +\Bigl(\frac{C(h_b)-C(h_{b'})}{\tau_h}\Bigr)^2
+ +\frac{1}{\tau_{\text{adr}}^2}\Bigl(\ln\frac{1+C(\text{adr}_b)}{1+C(\text{adr}_{b'})}\Bigr)^2\Biggr]\\
+\Delta^2_{\text{home type}}&=\frac{\bigl\|\boldsymbol\pi^{\text{units}}_b-\boldsymbol\pi^{\text{units}}_{b'}\bigr\|_2^2}{6\,\tau_{K_{\text{units}}}^2}
+ \qquad(\boldsymbol\pi^{\text{units}}\in\R^6:\ \text{1det, 1att, 2--4, 5--19, 20+, mobile})\\
+\Delta^2_{\text{tenure}}&=\Bigl(\frac{\pi^{\text{rent}}_b-\pi^{\text{rent}}_{b'}}{\tau_{\text{rent}}}\Bigr)^2\\
+\Delta^2_{\text{vehicles}}&=\frac12\Biggl[
+ \Bigl(\frac{\pi^{\text{0veh}}_b-\pi^{\text{0veh}}_{b'}}{\tau_{\text{0veh}}}\Bigr)^2
+ +\Bigl(\frac{C(v_b)-C(v_{b'})}{\tau_v}\Bigr)^2\Biggr]\\
+\Delta^2_{\text{commute}}&=\frac{1}{\tau_m^2}\Bigl(\ln\frac{1+C(m_b)}{1+C(m_{b'})}\Bigr)^2
+ \qquad(m=\text{median commute, min})\\
+\Delta^2_{\text{education}}&=\frac12\Biggl[
+ \Bigl(\frac{\text{SEDA}_b-\text{SEDA}_{b'}}{\tau_{\text{SEDA}}}\Bigr)^2
+ +\Bigl(\frac{\text{HUD}_b-\text{HUD}_{b'}}{\tau_{\text{HUD}}}\Bigr)^2\Biggr]\\
+\Delta^2_{\text{crime}}&=\frac12\Biggl[
+ \frac{1}{\tau_{V}^2}\Bigl(\ln\frac{1+C(V_b)}{1+C(V_{b'})}\Bigr)^2
+ +\frac{1}{\tau_{P}^2}\Bigl(\ln\frac{1+C(P_b)}{1+C(P_{b'})}\Bigr)^2\Biggr]
+ \qquad(\text{per }100\text{k})\\
+\Delta^2_{\text{property tax}}&=\Bigl(\frac{C(\text{tax}_b)-C(\text{tax}_{b'})}{\tau_{\text{tax}}}\Bigr)^2\\
+\Delta^2_{\text{occupation}}&=\frac{\bigl\|\boldsymbol\pi^{\text{occ}}_b-\boldsymbol\pi^{\text{occ}}_{b'}\bigr\|_2^2}{5\,\tau_{K_{\text{occ}}}^2}
+ \qquad(\boldsymbol\pi^{\text{occ}}\in\R^5:\ \text{mgmt, svc, sales, constr, prod})
+\end{align*}
+Every quantity here is the imputed value $\tilde t$ where the raw value was missing.
+
+\subsection{How each kind of term behaves}
+
+\begin{itemize}
+\item \textbf{Geography.} $\Delta^2_{\text{distance}}$ is the squared straight-line distance
+  through the Earth between the two population centers, in units of the region's pooled
+  coordinate s.d. Because the three axes share one divisor, the term is rotation-invariant and
+  isotropic: 10 km north counts the same as 10 km east. (Separate per-axis z-scores would
+  multiply N--S and E--W distances by different factors.) On a sphere of radius $\rho_\oplus$,
+  $\text{chord}=2\rho_\oplus\sin(\theta/2)$ for central angle $\theta$, which is within $0.1\%$
+  of the great-circle distance up to $\sim700$ km and increases monotonically with it beyond
+  that. In the tri-state run, two BGs 50 km apart get
+  $\Delta^2_{\text{distance}}=50^2/(3\cdot94.88^2)\approx0.093$.
+\item \textbf{Log-transformed features} (density, income, commute, age-dependency, crime).
+  The term depends on the \emph{ratio} $\frac{1+v_b}{1+v_{b'}}$, not the difference, so
+  doubling income adds the same distance at \$30k as at \$150k.
+\item \textbf{Winsorized features.} Differences beyond $[\ell_j,u_j]$ are capped:
+  $|C(v_b)-C(v_{b'})|\le u_j-\ell_j$.
+\item \textbf{Compositional blocks} (race, home type, tract language, occupation) are compared
+  by the plain Euclidean distance between the two share vectors, divided by one pooled scale
+  per block. One percentage point therefore counts the same in every category of a block.
+  Categories that vary more in the region still account for more of the block's variance;
+  for example, the tri-state s.d.\ of the NH white share is 0.325 but the NHPI share's is
+  0.005, so rare groups contribute little.
+  Before the fix, each share was z-scored on its own. That divided rare shares by tiny
+  s.d.s, so 1 pp of NHPI counted about $70\times$ as much as 1 pp of NH white, and a few BGs
+  reached $|z|\approx50$--$67$.
+  Single shares outside a block (renter, children, zero-vehicle, LEP) are still divided by
+  their own s.d.
+\item \textbf{Within-concept averaging.} Each concept's squared differences are
+  \emph{averaged} over its $n_g$ columns, not summed. That stops a 7-column concept outweighing
+  a 1-column concept.
+\end{itemize}
+
+\subsection{Every concept contributes equally on average}
+\label{sec:contrib}
+
+\begin{prop}
+Under regional scaling, averaging over all ordered pairs in the region (including $b=b'$),
+\[
+\frac1{n^2}\sum_{b\in\mathcal B_R}\sum_{b'\in\mathcal B_R}\Delta^2_g(b,b')=2c_g^2
+\quad\forall g,
+\qquad
+\frac1{n^2}\sum_{b,b'}D^2(b,b')=2\sum_{g}c_g^2=30 .
+\]
+\end{prop}
+\begin{proof}
+For any variable $y$, $\frac1{n^2}\sum_{b,b'}(y_b-y_{b'})^2=2\Var(y)$.
+
+A feature outside every pooled block has regional variance $\Var(\check z_{\cdot,j})=1$. For a
+pooled block $P$,
+\[
+\sum_{j\in P}\Var(\check z_{\cdot,j})=\frac{\sum_{j\in P}(\tau^R_j)^2}{(\tau^R_P)^2}=|P|.
+\]
+So each concept's columns have total regional variance $n_g$; the language concept, for
+example, gets $5$ from $K_{\text{lang}}$ plus $1$ from LEP. Hence
+$\frac{c_g^2}{n_g}\cdot n_g\cdot2=2c_g^2$.
+\end{proof}
+So with $c_g=1$, each of the 15 concepts accounts for $1/15$ of the average squared
+distance. One distance concept's ``average'' contribution of 2 corresponds to a chord of
+$\sqrt6\,\tau^R_{\mathcal E}\approx232$ km in the tri-state run. Raising $c_g$ to $\sqrt2$
+doubles concept $g$'s share. This equality does \emph{not} hold under \texttt{--scale national}.
+
+%======================================================================
+\section{How the minimization is carried out}
+
+\texttt{sklearn.cluster.KMeans(n\_clusters=k, n\_init=25, random\_state=seed)}
+(scikit-learn 1.7; defaults \texttt{init="k-means++"}, \texttt{algorithm="lloyd"},
+\texttt{max\_iter=300}, \texttt{tol=1e-4}) on the $n\times42$ matrix with rows $\x_b^\top$.
+
+\begin{enumerate}
+\item \textbf{Seeding (greedy k-means++).} Pick $\bmu_1^{(0)}$ uniformly from
+  $\{\x_b\}$. Then, for $i=2,\dots,k$, draw $2+\lfloor\ln k\rfloor$ candidates with probability
+  $\propto\min_{l<i}\|\x_b-\bmu^{(0)}_l\|^2$ and keep the candidate that most reduces the
+  potential.
+\item \textbf{Lloyd iterations} ($t=0,1,\dots$). Assign each BG to its nearest centroid:
+  \[
+  S_i^{(t)}=\Bigl\{b:\ \|\x_b-\bmu_i^{(t)}\|^2\le\|\x_b-\bmu_l^{(t)}\|^2\ \ \forall l\Bigr\}.
+  \]
+  Then update each centroid to its cluster mean:
+  \[
+  \bmu_i^{(t+1)}=\frac{1}{|S_i^{(t)}|}\sum_{b\in S_i^{(t)}}\x_b .
+  \]
+  Stop when the assignments stop changing, or when
+  $\sum_i\|\bmu_i^{(t+1)}-\bmu_i^{(t)}\|^2\le10^{-4}\cdot\frac1{42}\sum_j\Var(x_{\cdot,j})$,
+  or after 300 iterations. Under regional scaling
+  $\frac1{42}\sum_j\Var(x_{\cdot,j})=\frac{1}{42}\sum_g c_g^2=15/42$.
+\item \textbf{Restarts.} Repeat steps 1--2 25 times and keep the run with the lowest objective
+  \eqref{eq:obj} (\texttt{inertia\_}). The result is a local minimum of
+  \eqref{eq:wiki}, not a guaranteed global $\operatorname{arg\,min}$.
+\item \textbf{Relabeling.} Renumber clusters $1,\dots,k$ so that
+  $|S_1|\ge|S_2|\ge\dots\ge|S_k|$.
+\item \textbf{Diagnostic.} The mean silhouette is computed on a uniform sample $\mathcal U$ of
+  $\min(20000,n)$ BGs, using the same (unsquared) distance $D$:
+  \[
+  s(b)=\frac{\beta(b)-\alpha(b)}{\max\{\alpha(b),\beta(b)\}},\quad
+  \alpha(b)=\operatorname*{mean}_{b'\in S_{i(b)}\cap\,\mathcal U\setminus\{b\}}D(b,b'),\quad
+  \beta(b)=\min_{l\ne i(b)}\operatorname*{mean}_{b'\in S_l\cap\,\mathcal U}D(b,b').
+  \]
+\end{enumerate}
+
+%======================================================================
+\section{Feature table}
+
+$w_j=c_{g(j)}/\sqrt{n_{g(j)}}$ with $c_g=1$. Winsor bounds are in raw units, fitted on
+$\mathcal F$. $s_{[j]}$ is the national scale of $\tilde t$ from Step 3.
+
+\begingroup\small
+\setlength{\tabcolsep}{4pt}
+\begin{longtable}{@{}llllrrrr@{}}
+\caption{The $d=42$ features.}\label{tab:features}\\
+\toprule
+$j$ & feature & concept ($n_g$) & $T_j$ & $\ell_j$ & $u_j$ & $s_{[j]}$ & $w_j$\\
+\midrule\endfirsthead
+\toprule
+$j$ & feature & concept ($n_g$) & $T_j$ & $\ell_j$ & $u_j$ & $s_{[j]}$ & $w_j$\\
+\midrule\endhead
+\bottomrule\endfoot
+1 & \ft{ecef_x_km} & distance (3) & none & & & 862.33$^\dagger$ & 0.5774\\
+2 & \ft{ecef_y_km} & distance (3) & none & & & 862.33$^\dagger$ & 0.5774\\
+3 & \ft{ecef_z_km} & distance (3) & none & & & 862.33$^\dagger$ & 0.5774\\
+4 & \ft{race_nh_white_share} & race (7) & none & & & 0.1736$^\dagger$ & 0.3780\\
+5 & \ft{race_nh_black_share} & race (7) & none & & & 0.1736$^\dagger$ & 0.3780\\
+6 & \ft{race_nh_aian_share} & race (7) & none & & & 0.1736$^\dagger$ & 0.3780\\
+7 & \ft{race_nh_asian_share} & race (7) & none & & & 0.1736$^\dagger$ & 0.3780\\
+8 & \ft{race_nh_nhpi_share} & race (7) & none & & & 0.1736$^\dagger$ & 0.3780\\
+9 & \ft{race_nh_other_multi_share} & race (7) & none & & & 0.1736$^\dagger$ & 0.3780\\
+10 & \ft{race_hispanic_share} & race (7) & none & & & 0.1736$^\dagger$ & 0.3780\\
+11 & \ft{pop_density_per_sqkm} & density (1) & log1p & & & 2.0590 & 1.0000\\
+12 & \ft{lang_tract_english_only_share} & language (6) & none & & & 0.1305$^\dagger$ & 0.4082\\
+13 & \ft{lang_tract_spanish_share} & language (6) & none & & & 0.1305$^\dagger$ & 0.4082\\
+14 & \ft{lang_tract_other_ie_share} & language (6) & none & & & 0.1305$^\dagger$ & 0.4082\\
+15 & \ft{lang_tract_asian_pi_share} & language (6) & none & & & 0.1305$^\dagger$ & 0.4082\\
+16 & \ft{lang_tract_other_share} & language (6) & none & & & 0.1305$^\dagger$ & 0.4082\\
+17 & \ft{lep_hh_share} & language (6) & none & & & 0.0863 & 0.4082\\
+18 & \ft{median_age} & age (1) & none & & & 10.270 & 1.0000\\
+19 & \ft{median_hh_income} & income (1) & log1p & & & 0.5245 & 1.0000\\
+20 & \ft{hh_with_children_share} & dependents (3) & none & & & 0.1543 & 0.5774\\
+21 & \ft{avg_hh_size} & dependents (3) & winsor & 1.29 & 4.77 & 0.6117 & 0.5774\\
+22 & \ft{age_dependency_ratio} & dependents (3) & winsor\_log1p & 0.0349 & 3.0321 & 0.1916 & 0.5774\\
+23 & \ft{units_1_detached_share} & home type (6) & none & & & 0.1816$^\dagger$ & 0.4082\\
+24 & \ft{units_1_attached_share} & home type (6) & none & & & 0.1816$^\dagger$ & 0.4082\\
+25 & \ft{units_2_4_share} & home type (6) & none & & & 0.1816$^\dagger$ & 0.4082\\
+26 & \ft{units_5_19_share} & home type (6) & none & & & 0.1816$^\dagger$ & 0.4082\\
+27 & \ft{units_20plus_share} & home type (6) & none & & & 0.1816$^\dagger$ & 0.4082\\
+28 & \ft{units_mobile_other_share} & home type (6) & none & & & 0.1816$^\dagger$ & 0.4082\\
+29 & \ft{renter_share} & tenure (1) & none & & & 0.2733 & 1.0000\\
+30 & \ft{zero_vehicle_hh_share} & vehicles (2) & none & & & 0.1359 & 0.7071\\
+31 & \ft{mean_vehicles_per_hh} & vehicles (2) & winsor & 0.2137 & 3.0653 & 0.5207 & 0.7071\\
+32 & \ft{median_commute_min} & commute (1) & winsor\_log1p & 7.8486 & 62.320 & 0.3429 & 1.0000\\
+33 & \ft{school_quality_index} & education (2) & none & & & 0.3359 & 0.7071\\
+34 & \ft{hud_school_proficiency_index} & education (2) & none & & & 28.692 & 0.7071\\
+35 & \ft{violent_crime_rate} & crime (2) & winsor\_log1p & 16.103 & 1649.1 & 0.9922 & 0.7071\\
+36 & \ft{property_crime_rate} & crime (2) & winsor\_log1p & 54.774 & 5155.7 & 0.8896 & 0.7071\\
+37 & \ft{eff_property_tax_rate_tract} & property tax (1) & winsor & 0.001875 & 0.029171 & 0.005522 & 1.0000\\
+38 & \ft{occ_mgmt_prof_share} & occupation (5) & none & & & 0.1283$^\dagger$ & 0.4472\\
+39 & \ft{occ_service_share} & occupation (5) & none & & & 0.1283$^\dagger$ & 0.4472\\
+40 & \ft{occ_sales_office_share} & occupation (5) & none & & & 0.1283$^\dagger$ & 0.4472\\
+41 & \ft{occ_construction_maint_share} & occupation (5) & none & & & 0.1283$^\dagger$ & 0.4472\\
+42 & \ft{occ_production_transp_share} & occupation (5) & none & & & 0.1283$^\dagger$ & 0.4472\\
+\end{longtable}
+\endgroup
+\noindent$^\dagger$Pooled block scale $s_P$, shared by every column of the block: ECEF (km),
+race, home-type units, tract language and occupation. Under regional scaling, the national
+$s_{[j]}$ are replaced by the regional $\tau^R_{[j]}$. For CT+NJ+NY the pooled values are
+$\tau^R_{\mathcal E}=94.88$ km, $\tau^R_{K_{\text{race}}}=0.1764$,
+$\tau^R_{K_{\text{units}}}=0.2219$, $\tau^R_{K_{\text{lang}}}=0.1416$ and
+$\tau^R_{K_{\text{occ}}}=0.1280$.
+
+\end{document}

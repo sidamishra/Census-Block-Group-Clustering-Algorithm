@@ -1,0 +1,7 @@
+# generated / downloaded data (~1.6 GB; rebuilt by run_pipeline.py)
+data/
+__pycache__/
+*.pyc
+# clustering outputs: only the New York metro example is tracked
+outputs/*
+!outputs/cluster_36-34-09_k5/
