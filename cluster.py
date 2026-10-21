@@ -17,17 +17,25 @@ Then multiply by the per-column group weights so each concept contributes equal 
 
     python cluster.py --states conus --k 15 --zoom top10_metros --out examples/conus_k15
 
+Caching: each state's clipped block-group shapes are cached in data/cache/bg_shapes/ on first
+use, and --reuse skips k-means when the saved run matches, so a re-render takes seconds to a
+minute instead of ~10 minutes nationally.
+
 Map zoom panels (--zoom): one panel per named region in ZOOMS (e.g. chicago, bay_area,
 los_angeles) or group in ZOOM_GROUPS (top10_metros); default = one panel around the densest
 cluster. With more than 2 zooms the overview sits on top and the zooms form a grid below.
 
 Outputs in outputs/cluster_<states>_k<k>/ (or --out):
   assignments.csv   GEOID, cluster (clusters numbered by descending size)
+  run_info.json     inputs that determined the labels (states, k, seed, scale, n_init,
+                    scikit-learn version, hash of the feature files); --reuse loads
+                    assignments.csv instead of refitting when these all match
   profile.csv       per-cluster medians of raw features + BG/population counts
   centroids_z.csv   cluster centers in (unweighted) z units, to see what defines each cluster
   map.png           block groups colored by cluster, white BG boundaries, land BGs not
                     clustered (excluded rows, absent from ACS) in gray; water-only BGs
                     (ALAND = 0) are left blank so lakes/sounds don't read as land
+  map_4k.png        (--overview-4k only) the overview alone at 4K UHD, 3840 x 2160 px
   map_by_cluster.png  (k > 7 only) one small panel per cluster, that cluster in dark ink on
                     light gray: no color set keeps more than ~7 categories distinguishable
                     (see PALETTE), so these panels carry cluster identity without color
@@ -35,6 +43,9 @@ Outputs in outputs/cluster_<states>_k<k>/ (or --out):
 from __future__ import annotations
 
 import argparse
+import hashlib
+import json
+import os
 import zipfile
 from functools import lru_cache
 from pathlib import Path
@@ -44,6 +55,7 @@ import matplotlib.pyplot as plt
 from matplotlib.patches import Patch, Rectangle
 import numpy as np
 import pandas as pd
+import sklearn
 from sklearn.cluster import KMeans
 from sklearn.metrics import silhouette_score
 
@@ -51,17 +63,23 @@ from common import PROCESSED, RAW, ROOT, STATE_FIPS
 from features.geography import _download
 
 CB_COUNTY_URL = "https://www2.census.gov/geo/tiger/GENZ2023/shp/cb_2023_us_county_500k.zip"
+CB_COUNTY_ZIP = RAW / "geography" / "cb_2023_us_county_500k.zip"
+SHAPE_CACHE = ROOT / "data" / "cache" / "bg_shapes"
+SHAPE_CACHE_VERSION = 1  # bump when _state_shapes' processing changes, to invalidate the cache
+N_INIT = 25  # k-means restarts
 
 ECEF = ["ecef_x_km", "ecef_y_km", "ecef_z_km"]
 # Clusters 1-7: Okabe-Ito colorblind-safe palette (black dropped: it hides the boundaries).
-# Clusters 8-15: picked greedily from Paul Tol's and Kelly's sets to maximize the minimum
-# OKLab distance (x100) to all earlier colors and the gray, under normal vision and simulated
-# protan/deutan/tritan. Closest pair among all 15 + gray: 8.6 normal, 5.2-5.4 color-blind
-# (below the ~15 / 8 readability targets; no 15-color set reaches them), hence
-# map_by_cluster.png for k > 7.
+# Clusters 8-25: picked greedily (8-15 from Paul Tol's and Kelly's sets, 16-25 adding
+# matplotlib tab20 and Trubetskoy's 20) to maximize the minimum OKLab distance (x100) to all
+# earlier colors and the gray, under normal vision and simulated protan/deutan/tritan. Closest
+# pair among the first 15 + gray: 8.6 normal, 5.2-5.4 color-blind; among all 25: 7.5 normal,
+# 3.9-4.1 color-blind (below the ~15 / 8 readability targets; no set this large reaches them),
+# hence map_by_cluster.png for k > 7. Earlier colors never change, so maps keep their colors.
 PALETTE = ["#0072B2", "#E69F00", "#009E73", "#CC79A7", "#56B4E9", "#D55E00", "#F0E442",
            "#663333", "#AA3377", "#666633", "#225555", "#99DDFF", "#604E97", "#DDCC77",
-           "#EE6677"]
+           "#EE6677", "#332288", "#F032E6", "#C49C94", "#800000", "#CC3311", "#FABED4",
+           "#911EB4", "#999933", "#42D4F4", "#875692"]
 EXCLUDED_COLOR = "#BDBDBD"  # BGs present in TIGER but not clustered
 EDGE_COLOR = "white"
 HIGHLIGHT_COLOR, BACKGROUND_COLOR = "#1A1A1A", "#E4E4E4"  # map_by_cluster.png
@@ -122,7 +140,7 @@ def regional_matrix(z: pd.DataFrame, meta: pd.DataFrame, scale: str,
 
 @lru_cache(maxsize=1)
 def _cb_counties() -> gpd.GeoDataFrame:
-    zp = _download(CB_COUNTY_URL, RAW / "geography" / "cb_2023_us_county_500k.zip")
+    zp = _download(CB_COUNTY_URL, CB_COUNTY_ZIP)
     return gpd.read_file(f"zip://{zp}", columns=["STATEFP"]).to_crs(5070)
 
 
@@ -133,26 +151,46 @@ def land_mask(states: tuple[str, ...]):
     return c[c["STATEFP"].isin(states)].union_all()
 
 
+def _source_signature(paths: list[Path]) -> list:
+    return [[p.name, p.stat().st_size, int(p.stat().st_mtime)] for p in paths]
+
+
+def _state_shapes(st: str) -> gpd.GeoDataFrame:
+    """One state's clipped land BGs, cached in SHAPE_CACHE as GeoParquet (full resolution).
+    The cache is rebuilt when either source zip changes or SHAPE_CACHE_VERSION is bumped."""
+    tiger = RAW / "geography" / f"tl_2023_{st}_bg.zip"
+    _download(CB_COUNTY_URL, CB_COUNTY_ZIP)
+    sig = {"version": SHAPE_CACHE_VERSION, "sources": _source_signature([tiger, CB_COUNTY_ZIP])}
+    pq, meta = SHAPE_CACHE / f"{st}.parquet", SHAPE_CACHE / f"{st}.json"
+    if pq.exists() and meta.exists() and json.loads(meta.read_text()) == sig:
+        return gpd.read_parquet(pq)
+
+    with zipfile.ZipFile(tiger) as zf:
+        shp = next(n for n in zf.namelist() if n.endswith(".shp"))
+    g = gpd.read_file(f"zip://{tiger}!{shp}", columns=["GEOID", "ALAND", "AWATER"])
+    g = g[g["ALAND"] > 0].to_crs(5070)
+    wet = g[g["AWATER"] > 0]
+    clipped = gpd.clip(wet, land_mask((st,)), keep_geom_type=True)
+    clipped = clipped[~clipped.geometry.is_empty]
+    # tiny islands the generalized 1:500k shoreline misses keep their TIGER shape
+    keep = g[(g["AWATER"] == 0) | ~g["GEOID"].isin(clipped["GEOID"])]
+    out = pd.concat([keep, clipped], ignore_index=True).drop(columns=["ALAND", "AWATER"])
+
+    SHAPE_CACHE.mkdir(parents=True, exist_ok=True)
+    tmp = pq.with_suffix(f".{os.getpid()}.tmp")
+    out.to_parquet(tmp)
+    os.replace(tmp, pq)  # atomic, then the signature: a crash never leaves a "valid" partial cache
+    meta.write_text(json.dumps(sig))
+    return out
+
+
 def load_bg_shapes(states: list[str]) -> gpd.GeoDataFrame:
     """Every TIGER 2023 land block group in `states` (incl. ones never clustered), clipped to
     the shoreline: TIGER/Line BG polygons include their water area (the Farallon Islands BG
     covers 248 km2 of ocean for 0.4 km2 of land), which drew BGs across bays and straits.
-    Only BGs with water (AWATER > 0) are clipped, one state at a time, which keeps a
-    national run tractable."""
-    frames = []
-    for st in states:
-        zp = RAW / "geography" / f"tl_2023_{st}_bg.zip"
-        with zipfile.ZipFile(zp) as zf:
-            shp = next(n for n in zf.namelist() if n.endswith(".shp"))
-        g = gpd.read_file(f"zip://{zp}!{shp}", columns=["GEOID", "ALAND", "AWATER"])
-        g = g[g["ALAND"] > 0].to_crs(5070)
-        wet = g[g["AWATER"] > 0]
-        clipped = gpd.clip(wet, land_mask((st,)), keep_geom_type=True)
-        clipped = clipped[~clipped.geometry.is_empty]
-        # tiny islands the generalized 1:500k shoreline misses keep their TIGER shape
-        keep = g[(g["AWATER"] == 0) | ~g["GEOID"].isin(clipped["GEOID"])]
-        frames += [keep, clipped]
-    return pd.concat(frames, ignore_index=True).drop(columns=["ALAND", "AWATER"])
+    Only BGs with water (AWATER > 0) are clipped, one state at a time; each state's result is
+    cached (data/cache/bg_shapes/), so only the first map of a state pays for the clipping."""
+    return pd.concat([_state_shapes(st) for st in states], ignore_index=True)
 
 
 def zoom_extent(name: str) -> tuple[str, float, float, float, float]:
@@ -203,6 +241,22 @@ def plot_map(g: gpd.GeoDataFrame, colors: dict, title: str, zooms: list, path,
     plt.close(fig)
 
 
+def plot_overview(g: gpd.GeoDataFrame, colors: dict, title: str, path,
+                  size: tuple[int, int] = (3840, 2160), dpi: int = 200) -> None:
+    """Overview map alone at an exact pixel size (default 4K UHD, 3840 x 2160)."""
+    fig = plt.figure(figsize=(size[0] / dpi, size[1] / dpi), dpi=dpi)
+    ax = fig.add_axes([0.01, 0.09, 0.98, 0.85])
+    lw = 0 if len(g) > LARGE_MAP_BGS else 0.05
+    g.plot(ax=ax, color=g["color"], edgecolor=EDGE_COLOR, linewidth=lw)
+    ax.set_axis_off()
+    fig.suptitle(title, y=0.975, fontsize=16)
+    handles = [Patch(facecolor=col, label=str(c)) for c, col in colors.items()]
+    fig.legend(handles=handles, title="cluster", loc="lower center", ncol=len(handles),
+               frameon=False, fontsize=11)
+    fig.savefig(path, dpi=dpi)  # no bbox_inches="tight": it would change the pixel size
+    plt.close(fig)
+
+
 def plot_by_cluster(g: gpd.GeoDataFrame, colors: dict, pop_share: pd.Series, states: list[str],
                     path, ncols: int = 5) -> None:
     """Small multiples: one panel per cluster, that cluster dark on the light-gray land area."""
@@ -227,6 +281,35 @@ def plot_by_cluster(g: gpd.GeoDataFrame, colors: dict, pop_share: pd.Series, sta
     plt.close(fig)
 
 
+def run_info(states: list[str], k: int, seed: int, scale: str) -> dict:
+    """Everything that determines the k-means labels; stored as run_info.json next to them."""
+    h = hashlib.sha256()
+    for p in (PROCESSED / "features_standardized.parquet", PROCESSED / "feature_metadata.csv"):
+        h.update(p.read_bytes())
+    return {"states": list(states), "k": k, "seed": seed, "scale": scale, "n_init": N_INIT,
+            "sklearn": sklearn.__version__, "features_sha256": h.hexdigest()}
+
+
+def reuse_labels(out: Path, info: dict, index: pd.Index) -> pd.Series | None:
+    """Saved labels if out/run_info.json matches `info` and covers `index`, else None."""
+    info_path, assign_path = out / "run_info.json", out / "assignments.csv"
+    if not (info_path.exists() and assign_path.exists()):
+        print("--reuse: no saved run here; fitting k-means")
+        return None
+    saved = json.loads(info_path.read_text())
+    if saved != info:
+        changed = sorted(key for key in info if saved.get(key) != info[key])
+        print(f"--reuse: saved run differs ({', '.join(changed)}); fitting k-means")
+        return None
+    labels = pd.read_csv(assign_path, dtype={"GEOID": str}).set_index("GEOID")["cluster"]
+    labels = labels.reindex(index)
+    if labels.isna().any():
+        print("--reuse: saved assignments don't cover these block groups; fitting k-means")
+        return None
+    print(f"--reuse: loaded labels from {assign_path}")
+    return labels.astype(int).rename("cluster")
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--states", nargs="+", required=True,
@@ -237,6 +320,11 @@ def main():
     ap.add_argument("--zoom", nargs="+", choices=[*ZOOMS, *ZOOM_GROUPS], default=None,
                     help="zoom panels to draw (default: around the densest cluster)")
     ap.add_argument("--out", default=None, help="output folder (default outputs/cluster_<states>_k<k>)")
+    ap.add_argument("--overview-4k", action="store_true",
+                    help="also write map_4k.png: the overview alone at 3840 x 2160")
+    ap.add_argument("--reuse", action="store_true",
+                    help="reuse the output folder's assignments.csv instead of refitting k-means, "
+                         "if its run_info.json matches these inputs (else refit)")
     args = ap.parse_args()
     region = "contiguous US" if args.states == ["conus"] else None
     if region:
@@ -253,22 +341,26 @@ def main():
     X = regional_matrix(z, meta, args.scale)
     print(f"{len(X):,} block groups x {X.shape[1]} features")
 
-    km = KMeans(n_clusters=args.k, n_init=25, random_state=args.seed).fit(X.values)
-    # renumber clusters 1..k by descending size
-    order = pd.Series(km.labels_).value_counts().index
-    relabel = {old: new for new, old in enumerate(order, start=1)}
-    labels = pd.Series([relabel[l] for l in km.labels_], index=X.index, name="cluster")
+    states_tag = "conus" if args.states == CONUS else "-".join(args.states)
+    tag = f"cluster_{states_tag}_k{args.k}" + ("" if args.scale == "regional" else "_national")
+    out = Path(args.out) if args.out else ROOT / "outputs" / tag
+    out.mkdir(parents=True, exist_ok=True)
+
+    info = run_info(args.states, args.k, args.seed, args.scale)
+    labels = reuse_labels(out, info, X.index) if args.reuse else None
+    if labels is None:
+        km = KMeans(n_clusters=args.k, n_init=N_INIT, random_state=args.seed).fit(X.values)
+        # renumber clusters 1..k by descending size
+        order = pd.Series(km.labels_).value_counts().index
+        relabel = {old: new for new, old in enumerate(order, start=1)}
+        labels = pd.Series([relabel[l] for l in km.labels_], index=X.index, name="cluster")
+        labels.to_frame().assign(state=labels.index.str[:2]).to_csv(out / "assignments.csv")
+        (out / "run_info.json").write_text(json.dumps(info, indent=2))
 
     rng = np.random.default_rng(args.seed)
     idx = rng.choice(len(X), size=min(20000, len(X)), replace=False)
     sil = silhouette_score(X.values[idx], labels.values[idx])
     print(f"silhouette (20k sample): {sil:.3f}")
-
-    states_tag = "conus" if args.states == CONUS else "-".join(args.states)
-    tag = f"cluster_{states_tag}_k{args.k}" + ("" if args.scale == "regional" else "_national")
-    out = Path(args.out) if args.out else ROOT / "outputs" / tag
-    out.mkdir(parents=True, exist_ok=True)
-    labels.to_frame().assign(state=labels.index.str[:2]).to_csv(out / "assignments.csv")
 
     r = raw.loc[X.index, PROFILE_COLS].join(labels)
     prof = r.groupby("cluster").median().drop(columns="population")
@@ -294,7 +386,10 @@ def main():
         zooms = [zoom_extent(z) for z in args.zoom]
     else:
         zooms = [densest_extent(g, prof["pop_density_per_sqkm"].idxmax())]
-    plot_map(g, colors, f"Block-group clusters (k={args.k}) — {region}", zooms, out / "map.png")
+    title = f"Block-group clusters (k={args.k}) — {region}"
+    plot_map(g, colors, title, zooms, out / "map.png")
+    if args.overview_4k:
+        plot_overview(g, colors, title, out / "map_4k.png")
     if args.k > 7:
         plot_by_cluster(g, colors, prof["pct_of_population"], args.states,
                         out / "map_by_cluster.png")

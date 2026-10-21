@@ -1,0 +1,13 @@
+{
+  "states": [
+    "36",
+    "34",
+    "09"
+  ],
+  "k": 5,
+  "seed": 0,
+  "scale": "regional",
+  "n_init": 25,
+  "sklearn": "1.7.0",
+  "features_sha256": "cda14ec62f3e3ba1c07d2461589b37c3b82eac3278079df7ecaf18f7e495ad34"
+}

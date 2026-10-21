@@ -61,6 +61,17 @@ TIGER/Line block groups include their water area and would otherwise reach acros
 colorblind-safe Okabe-Ito colors; no palette keeps more than about 7 categories reliably
 distinguishable, so for k > 7 `map_by_cluster.png` also shows each cluster in its own panel.
 By default features are re-standardized within the selected states (`--scale regional`).
+`--overview-4k` also writes `map_4k.png`, the overview alone at 3840 x 2160.
+
+**Caching.** Each state's shoreline-clipped block-group shapes are cached in
+`data/cache/bg_shapes/` the first time they are drawn (rebuilt automatically if the source
+files change). Every run also writes `run_info.json` (states, k, seed, scale, scikit-learn
+version and a hash of the feature files); with `--reuse`, a rerun into the same `--out` folder
+loads `assignments.csv` instead of refitting k-means when all of these match, and refits
+otherwise. For the contiguous US, loading all shapes from the cache takes ~6 s (vs. several
+minutes of reading and clipping), and a full `--reuse` re-render of the example (overview +
+10 zooms, per-cluster map and a 4K overview) took ~3.5 min, almost all of it drawing 235,000 polygons;
+the first run took ~11 min. The national cache is ~1.1 GB, all under `data/` (not in git).
 
 ## Examples
 
@@ -87,6 +98,18 @@ Some patterns, from `profile.csv` (medians per cluster):
   mainly in Boston, Chicago and Washington.
 ```
 python cluster.py --states conus --k 15 --zoom top10_metros --out examples/conus_k15   # ~11 min
+```
+
+### Contiguous US, k = 25 (zooms: 10 largest metro areas)
+
+`examples/conus_k25/` - same block groups and zooms as above with 25 clusters, silhouette
+0.074 (vs. 0.082 at k = 15). Colors 16-25 extend the palette; with 25 categories several
+pairs are hard to tell apart, so use `map_by_cluster.png` to identify a cluster.
+
+![Contiguous US example, k=25](examples/conus_k25/map.png)
+![Contiguous US k=25 clusters one at a time](examples/conus_k25/map_by_cluster.png)
+```
+python cluster.py --states conus --k 25 --zoom top10_metros --out examples/conus_k25   # ~9 min with cached shapes
 ```
 
 ### New York metro (NY, NJ, CT), k = 5
