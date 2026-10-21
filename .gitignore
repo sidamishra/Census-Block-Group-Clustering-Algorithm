@@ -2,6 +2,5 @@
 data/
 __pycache__/
 *.pyc
-# clustering outputs: only the New York metro example is tracked
-outputs/*
-!outputs/cluster_36-34-09_k5/
+# clustering outputs (worked examples live in examples/)
+outputs/

@@ -1,6 +1,7 @@
 """K-means clustering of block groups for a chosen set of states.
 
     python cluster.py --states 36 34 09 --k 5
+    python cluster.py --states 06 --k 15 --zoom bay_area los_angeles --out examples/california_k15
 
 Input: data/processed/features_standardized.parquet (transformed + imputed + national z-scores)
 and feature_metadata.csv (concept group weights).
@@ -14,13 +15,19 @@ Scaling (--scale):
   * national: use the national z-scores as-is (clusters comparable across regional runs).
 Then multiply by the per-column group weights so each concept contributes equal variance.
 
-Outputs in outputs/cluster_<states>_k<k>/:
+Map zoom panels (--zoom): one panel per named region in ZOOMS (e.g. chicago, bay_area,
+los_angeles); default = one panel around the densest cluster.
+
+Outputs in outputs/cluster_<states>_k<k>/ (or --out):
   assignments.csv   GEOID, cluster (clusters numbered by descending size)
   profile.csv       per-cluster medians of raw features + BG/population counts
   centroids_z.csv   cluster centers in (unweighted) z units, to see what defines each cluster
-  map.png           block groups colored by cluster (colorblind-safe), white BG boundaries,
-                    land BGs not clustered (excluded rows, absent from ACS) in gray;
-                    water-only BGs (ALAND = 0) are left blank so lakes/sounds don't read as land
+  map.png           block groups colored by cluster, white BG boundaries, land BGs not
+                    clustered (excluded rows, absent from ACS) in gray; water-only BGs
+                    (ALAND = 0) are left blank so lakes/sounds don't read as land
+  map_by_cluster.png  (k > 7 only) one small panel per cluster, that cluster in dark ink on
+                    light gray: no color set keeps more than ~7 categories distinguishable
+                    (see PALETTE), so these panels carry cluster identity without color
 """
 from __future__ import annotations
 
@@ -30,21 +37,39 @@ from pathlib import Path
 
 import geopandas as gpd
 import matplotlib.pyplot as plt
-from matplotlib.patches import Patch
+from matplotlib.patches import Patch, Rectangle
 import numpy as np
 import pandas as pd
 from sklearn.cluster import KMeans
 from sklearn.metrics import silhouette_score
 
 from common import PROCESSED, RAW, ROOT
+from features.geography import _download
+
+CB_COUNTY_URL = "https://www2.census.gov/geo/tiger/GENZ2023/shp/cb_2023_us_county_500k.zip"
 
 ECEF = ["ecef_x_km", "ecef_y_km", "ecef_z_km"]
-# Okabe-Ito colorblind-safe palette (black dropped: it hides the boundaries). Past 7
-# clusters, Paul Tol "muted" colors are appended; those are less reliably distinguishable.
+# Clusters 1-7: Okabe-Ito colorblind-safe palette (black dropped: it hides the boundaries).
+# Clusters 8-15: picked greedily from Paul Tol's and Kelly's sets to maximize the minimum
+# OKLab distance (x100) to all earlier colors and the gray, under normal vision and simulated
+# protan/deutan/tritan. Closest pair among all 15 + gray: 8.6 normal, 5.2-5.4 color-blind
+# (below the ~15 / 8 readability targets; no 15-color set reaches them), hence
+# map_by_cluster.png for k > 7.
 PALETTE = ["#0072B2", "#E69F00", "#009E73", "#CC79A7", "#56B4E9", "#D55E00", "#F0E442",
-           "#882255", "#332288", "#999933"]
+           "#663333", "#AA3377", "#666633", "#225555", "#99DDFF", "#604E97", "#DDCC77",
+           "#EE6677"]
 EXCLUDED_COLOR = "#BDBDBD"  # BGs present in TIGER but not clustered
 EDGE_COLOR = "white"
+HIGHLIGHT_COLOR, BACKGROUND_COLOR = "#1A1A1A", "#E4E4E4"  # map_by_cluster.png
+# zoom panels: name -> (label, lon_min, lat_min, lon_max, lat_max)
+ZOOMS = {
+    "nyc": ("New York City", -74.27, 40.49, -73.68, 40.92),
+    "chicago": ("Chicago", -88.05, 41.62, -87.52, 42.08),
+    "bay_area": ("San Francisco Bay Area", -122.65, 37.20, -121.75, 38.05),
+    "los_angeles": ("Los Angeles", -118.75, 33.65, -117.65, 34.35),
+    "houston": ("Houston", -95.85, 29.45, -94.95, 30.15),
+    "dfw": ("Dallas-Fort Worth", -97.55, 32.50, -96.50, 33.20),
+}
 PROFILE_COLS = [
     "population", "pop_density_per_sqkm", "median_hh_income", "median_age",
     "race_nh_white_share", "race_nh_black_share", "race_hispanic_share", "race_nh_asian_share",
@@ -78,8 +103,17 @@ def regional_matrix(z: pd.DataFrame, meta: pd.DataFrame, scale: str,
     return x * w
 
 
+def land_mask(states: list[str]):
+    """Shoreline-clipped land area of `states` (Census cartographic county boundaries, 1:500k)."""
+    zp = _download(CB_COUNTY_URL, RAW / "geography" / "cb_2023_us_county_500k.zip")
+    c = gpd.read_file(f"zip://{zp}", columns=["STATEFP"])
+    return c[c["STATEFP"].isin(states)].to_crs(5070).union_all()
+
+
 def load_bg_shapes(states: list[str]) -> gpd.GeoDataFrame:
-    """Every TIGER 2023 land block group in `states` (incl. ones never clustered)."""
+    """Every TIGER 2023 land block group in `states` (incl. ones never clustered), clipped to
+    the shoreline: TIGER/Line BG polygons include their water area (the Farallon Islands BG
+    covers 248 km2 of ocean for 0.4 km2 of land), which drew BGs across bays and straits."""
     frames = []
     for st in states:
         zp = RAW / "geography" / f"tl_2023_{st}_bg.zip"
@@ -87,7 +121,68 @@ def load_bg_shapes(states: list[str]) -> gpd.GeoDataFrame:
             shp = next(n for n in zf.namelist() if n.endswith(".shp"))
         frames.append(gpd.read_file(f"zip://{zp}!{shp}", columns=["GEOID", "ALAND"]))
     g = pd.concat(frames, ignore_index=True)
-    return g[g["ALAND"] > 0].drop(columns="ALAND").to_crs(5070)
+    g = g[g["ALAND"] > 0].drop(columns="ALAND").to_crs(5070)
+    clipped = gpd.clip(g, land_mask(states), keep_geom_type=True)
+    clipped = clipped[~clipped.geometry.is_empty]
+    # tiny islands the generalized 1:500k shoreline misses keep their TIGER shape
+    return pd.concat([clipped, g[~g["GEOID"].isin(clipped["GEOID"])]], ignore_index=True)
+
+
+def zoom_extent(name: str) -> tuple[str, float, float, float, float]:
+    """ZOOMS entry -> (label, x0, x1, y0, y1) in EPSG:5070."""
+    label, lon0, lat0, lon1, lat1 = ZOOMS[name]
+    p = gpd.GeoSeries(gpd.points_from_xy([lon0, lon1, lon0, lon1], [lat0, lat0, lat1, lat1]),
+                      crs=4326).to_crs(5070)
+    return label, p.x.min(), p.x.max(), p.y.min(), p.y.max()
+
+
+def densest_extent(g: gpd.GeoDataFrame, cluster: int, pad: float = 15_000):
+    """Around the given cluster: 5th-95th pct of its BG centroids, padded."""
+    c = g[g["cluster"] == cluster].geometry.centroid
+    x0, x1 = c.x.quantile([.05, .95]); y0, y1 = c.y.quantile([.05, .95])
+    return f"densest cluster ({cluster}) area", x0 - pad, x1 + pad, y0 - pad, y1 + pad
+
+
+def plot_map(g: gpd.GeoDataFrame, colors: dict, title: str, zooms: list, path) -> None:
+    fig, axes = plt.subplots(1, 1 + len(zooms), figsize=(10 * (1 + len(zooms)), 10))
+    ax, zaxes = axes[0], axes[1:]
+    g.plot(ax=ax, color=g["color"], edgecolor=EDGE_COLOR, linewidth=0.05)
+    handles = [Patch(facecolor=col, label=str(c)) for c, col in colors.items()]
+    ax.legend(handles=handles, title="cluster", loc="upper center", bbox_to_anchor=(0.5, 0.0),
+              ncol=min(len(handles), 8), frameon=False)
+    ax.set_title(title)
+    for axz, (label, x0, x1, y0, y1) in zip(zaxes, zooms):
+        gz = g.cx[x0:x1, y0:y1]
+        gz.plot(ax=axz, color=gz["color"], edgecolor=EDGE_COLOR, linewidth=0.25)
+        axz.set_xlim(x0, x1); axz.set_ylim(y0, y1)
+        axz.set_title(f"Zoom: {label}")
+    for a in axes:
+        a.set_axis_off()
+    fig.savefig(path, dpi=200, bbox_inches="tight")
+    plt.close(fig)
+
+
+def plot_by_cluster(g: gpd.GeoDataFrame, colors: dict, pop_share: pd.Series, path,
+                    ncols: int = 5) -> None:
+    """Small multiples: one panel per cluster, that cluster dark on light gray."""
+    k = len(colors)
+    nrows = -(-k // ncols)
+    x0, y0, x1, y1 = g.total_bounds
+    aspect = (y1 - y0) / (x1 - x0)  # panel height follows the region's shape
+    fig, axes = plt.subplots(nrows, ncols, figsize=(4 * ncols, (4 * aspect + 0.4) * nrows))
+    for ax, (c, col) in zip(axes.flat, colors.items()):
+        g.plot(ax=ax, color=np.where(g["cluster"] == c, HIGHLIGHT_COLOR, BACKGROUND_COLOR),
+               linewidth=0)
+        ax.set_title(f"Cluster {c} · {pop_share[c]:.1%} of population", loc="left", x=0.09,
+                     fontsize=11)
+        # swatch = this cluster's color on map.png
+        ax.add_patch(Rectangle((0, 1.01), 0.07, 0.05, transform=ax.transAxes, facecolor=col,
+                               edgecolor="none", clip_on=False))
+    for ax in axes.flat:
+        ax.set_axis_off()
+    fig.tight_layout()
+    fig.savefig(path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
 
 
 def main():
@@ -96,6 +191,9 @@ def main():
     ap.add_argument("--k", type=int, default=5)
     ap.add_argument("--scale", choices=["regional", "national"], default="regional")
     ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--zoom", nargs="+", choices=list(ZOOMS), default=None,
+                    help="zoom panels to draw (default: around the densest cluster)")
+    ap.add_argument("--out", default=None, help="output folder (default outputs/cluster_<states>_k<k>)")
     args = ap.parse_args()
 
     z = pd.read_parquet(PROCESSED / "features_standardized.parquet")
@@ -118,7 +216,7 @@ def main():
     print(f"silhouette (20k sample): {sil:.3f}")
 
     tag = f"cluster_{'-'.join(args.states)}_k{args.k}" + ("" if args.scale == "regional" else "_national")
-    out = ROOT / "outputs" / tag
+    out = Path(args.out) if args.out else ROOT / "outputs" / tag
     out.mkdir(parents=True, exist_ok=True)
     labels.to_frame().assign(state=labels.index.str[:2]).to_csv(out / "assignments.csv")
 
@@ -135,28 +233,21 @@ def main():
         (X / meta.set_index("column")["group_weight"].reindex(X.columns)).join(labels).groupby("cluster").mean()
     zc.T.round(2).to_csv(out / "centroids_z.csv")
 
-    if args.k > 7:
-        print(f"note: k={args.k} > 7, map colors beyond the 7th are not colorblind-safe")
+    if args.k > len(PALETTE):
+        print(f"note: k={args.k} > {len(PALETTE)}, map colors repeat; use map_by_cluster.png")
+    elif args.k > 7:
+        print(f"note: k={args.k} > 7, map colors are not all distinguishable; see map_by_cluster.png")
     colors = {c: PALETTE[(c - 1) % len(PALETTE)] for c in range(1, args.k + 1)}
     g = load_bg_shapes(args.states).merge(labels, left_on="GEOID", right_index=True, how="left")
     g["color"] = g["cluster"].map(colors).fillna(EXCLUDED_COLOR)
-    fig, (ax, axz) = plt.subplots(1, 2, figsize=(20, 10), gridspec_kw={"width_ratios": [1, 1]})
-    g.plot(ax=ax, color=g["color"], edgecolor=EDGE_COLOR, linewidth=0.05)
-    handles = [Patch(facecolor=col, label=str(c)) for c, col in colors.items()]
-    ax.legend(handles=handles, title="cluster", loc="lower right")
-    ax.set_title(f"Block-group clusters (k={args.k}) — states {', '.join(args.states)}")
-    # zoom panel: around the densest cluster (5th-95th pct of its centroids, padded 15 km)
-    dense = prof["pop_density_per_sqkm"].idxmax()
-    c = g[g["cluster"] == dense].geometry.centroid
-    pad = 15_000
-    x0, x1 = c.x.quantile([.05, .95]); y0, y1 = c.y.quantile([.05, .95])
-    gz = g.cx[x0 - pad:x1 + pad, y0 - pad:y1 + pad]
-    gz.plot(ax=axz, color=gz["color"], edgecolor=EDGE_COLOR, linewidth=0.25)
-    axz.set_xlim(x0 - pad, x1 + pad); axz.set_ylim(y0 - pad, y1 + pad)
-    axz.set_title(f"Zoom: densest cluster ({dense}) area")
-    for a in (ax, axz):
-        a.set_axis_off()
-    fig.savefig(out / "map.png", dpi=200, bbox_inches="tight")
+    if args.zoom:
+        zooms = [zoom_extent(z) for z in args.zoom]
+    else:
+        zooms = [densest_extent(g, prof["pop_density_per_sqkm"].idxmax())]
+    plot_map(g, colors, f"Block-group clusters (k={args.k}) — states {', '.join(args.states)}",
+             zooms, out / "map.png")
+    if args.k > 7:
+        plot_by_cluster(g, colors, prof["pct_of_population"], out / "map_by_cluster.png")
     print(f"wrote {out}")
     with pd.option_context("display.width", 200, "display.max_columns", 20):
         print(prof.T.round(3))

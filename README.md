@@ -4,9 +4,10 @@ Groups 2020 Census Block Groups (BGs) into neighborhood types with k-means. A na
 feature matrix (50 states + DC, index = 12-char `GEOID`) describes neighborhood character
 (location, demographics, housing, schools, crime, taxes, occupations); it is standardized,
 weighted so every concept counts equally, and clustered for any set of states.
-`kmeans_formulation.tex` states the exact objective and distance.
+`kmeans_formulation.tex` (compiled: `kmeans_formulation.pdf`) states the exact objective and
+distance.
 
-![NY-NJ-CT example, k=5](outputs/cluster_36-34-09_k5/map.png)
+![NY-NJ-CT example, k=5](examples/ny-nj-ct_k5/map.png)
 
 ## Layout
 
@@ -16,8 +17,8 @@ features/<name>.py        one module per source; build() -> raw DataFrame, __mai
 standardize.py            merge + select + transform + impute + scale (final step; importable transform())
 run_pipeline.py           runs every feature module (if needed) then standardize
 cluster.py                k-means for chosen states -> outputs/cluster_<states>_k<k>/
-kmeans_formulation.tex    mathematical statement of the full method
-outputs/cluster_36-34-09_k5/   New York metro example (below)
+kmeans_formulation.tex/.pdf   mathematical statement of the full method
+examples/                 three worked examples (below)
 data/raw/<name>/          cached downloads (reruns are offline)
 data/interim/<name>.parquet   raw per-module features (239,741 BGs)
 data/processed/           outputs below
@@ -47,14 +48,25 @@ Set `CENSUS_API_KEY` for ACS rebuilds. To apply the fitted transform to new/edit
 Clustering (details in the `cluster.py` docstring):
 ```
 python cluster.py --states 36 34 09 --k 5        # state FIPS codes; ~15 s
+python cluster.py --states 06 --k 15 --zoom bay_area los_angeles --out examples/california_k15
 ```
 Writes `assignments.csv`, `profile.csv` (per-cluster medians), `centroids_z.csv` and `map.png`
-(colorblind-safe palette; BGs not clustered in gray) to `outputs/cluster_<states>_k<k>/`.
+(BGs not clustered in gray) to `outputs/cluster_<states>_k<k>/` or `--out`. The map has one
+zoom panel per `--zoom` region (`nyc`, `chicago`, `bay_area`, `los_angeles`, `houston`, `dfw`;
+add more in `cluster.ZOOMS`), or one around the densest cluster by default. Block-group shapes
+are clipped to the shoreline (Census 1:500k county boundaries, downloaded once), because
+TIGER/Line block groups include their water area and would otherwise reach across bays. Clusters 1-7 use the
+colorblind-safe Okabe-Ito colors; no palette keeps more than about 7 categories reliably
+distinguishable, so for k > 7 `map_by_cluster.png` also shows each cluster in its own panel.
 By default features are re-standardized within the selected states (`--scale regional`).
 
-## Example: New York metro (NY, NJ, CT), k = 5
+## Examples
 
-`outputs/cluster_36-34-09_k5/` - 24,680 block groups, silhouette 0.151. Medians per cluster:
+Each folder in `examples/` holds the full outputs of one run.
+
+### New York metro (NY, NJ, CT), k = 5
+
+`examples/ny-nj-ct_k5/` - 24,680 block groups, silhouette 0.151. Medians per cluster:
 
 | Cluster | Share of pop. | Density (/km²) | Median HH income | Renters | Single-family detached | Median commute (min) | Character |
 |---|---|---|---|---|---|---|---|
@@ -65,6 +77,45 @@ By default features are re-standardized within the selected states (`--scale reg
 | 5 | 13% | 24,618 | $54,400 | 89% | 0% | 43 | Dense, lower-income, mostly renter NYC neighborhoods |
 
 The right panel of the map zooms on New York City.
+```
+python cluster.py --states 36 34 09 --k 5 --out examples/ny-nj-ct_k5
+```
+
+### Pennsylvania, Ohio, Indiana, Illinois, k = 15 (zoom: Chicago)
+
+`examples/pa-oh-in-il_k15/` - 34,498 block groups, silhouette 0.086.
+
+![PA-OH-IN-IL example, k=15](examples/pa-oh-in-il_k15/map.png)
+![PA-OH-IN-IL clusters one at a time](examples/pa-oh-in-il_k15/map_by_cluster.png)
+
+Rural and small-town areas split largely along state lines (cluster 11 is almost all of rural
+Illinois; clusters 2 and 4 cover rural Pennsylvania and Indiana/western Ohio). Between rural
+Illinois and Indiana, property tax accounts for ~78% of the weighted feature gap (Illinois
+rates are far higher); between Indiana and Pennsylvania, physical distance accounts for ~67%
+and property tax ~18%. The tax difference is real, but it makes clusters follow state lines.
+```
+python cluster.py --states 42 39 18 17 --k 15 --zoom chicago --out examples/pa-oh-in-il_k15
+```
+
+### California, k = 15 (zooms: Bay Area, Los Angeles)
+
+`examples/california_k15/` - 25,446 block groups, silhouette 0.090.
+
+![California example, k=15](examples/california_k15/map.png)
+![California clusters one at a time](examples/california_k15/map_by_cluster.png)
+```
+python cluster.py --states 06 --k 15 --zoom bay_area los_angeles --out examples/california_k15
+```
+
+### Texas, k = 15 (zooms: Houston, Dallas-Fort Worth)
+
+`examples/texas_k15/` - 18,441 block groups, silhouette 0.090.
+
+![Texas example, k=15](examples/texas_k15/map.png)
+![Texas clusters one at a time](examples/texas_k15/map_by_cluster.png)
+```
+python cluster.py --states 48 --k 15 --zoom houston dfw --out examples/texas_k15
+```
 
 ## Features (default selection)
 
@@ -129,6 +180,9 @@ national run (`python features/building_footprints.py all`) takes ~2.5 h and dow
   Scores reflect achievement (SES-confounded), not school value-added.
 - **HUD school index:** 2015-16 data, state-relative proficiency (not comparable across states),
   missing for AK/ME/KS/DE (imputed).
+- **State borders:** in multi-state runs, features that jump at state lines (above all
+  property tax rates; also crime reporting and the state-relative HUD school index) can make
+  clusters follow state lines - see the PA-OH-IN-IL example.
 - **Universe:** 40 TIGER BGs (Suffolk Co., NY + one Ulster Co. BG) are absent from ACS 2023
   and from every output.
 - **Footprints:** only run for Delaware (see above).
