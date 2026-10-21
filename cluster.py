@@ -15,8 +15,11 @@ Scaling (--scale):
   * national: use the national z-scores as-is (clusters comparable across regional runs).
 Then multiply by the per-column group weights so each concept contributes equal variance.
 
+    python cluster.py --states conus --k 15 --zoom top10_metros --out examples/conus_k15
+
 Map zoom panels (--zoom): one panel per named region in ZOOMS (e.g. chicago, bay_area,
-los_angeles); default = one panel around the densest cluster.
+los_angeles) or group in ZOOM_GROUPS (top10_metros); default = one panel around the densest
+cluster. With more than 2 zooms the overview sits on top and the zooms form a grid below.
 
 Outputs in outputs/cluster_<states>_k<k>/ (or --out):
   assignments.csv   GEOID, cluster (clusters numbered by descending size)
@@ -33,6 +36,7 @@ from __future__ import annotations
 
 import argparse
 import zipfile
+from functools import lru_cache
 from pathlib import Path
 
 import geopandas as gpd
@@ -43,7 +47,7 @@ import pandas as pd
 from sklearn.cluster import KMeans
 from sklearn.metrics import silhouette_score
 
-from common import PROCESSED, RAW, ROOT
+from common import PROCESSED, RAW, ROOT, STATE_FIPS
 from features.geography import _download
 
 CB_COUNTY_URL = "https://www2.census.gov/geo/tiger/GENZ2023/shp/cb_2023_us_county_500k.zip"
@@ -69,7 +73,20 @@ ZOOMS = {
     "los_angeles": ("Los Angeles", -118.75, 33.65, -117.65, 34.35),
     "houston": ("Houston", -95.85, 29.45, -94.95, 30.15),
     "dfw": ("Dallas-Fort Worth", -97.55, 32.50, -96.50, 33.20),
+    "atlanta": ("Atlanta", -84.75, 33.45, -84.05, 34.10),
+    "washington_dc": ("Washington, DC", -77.45, 38.65, -76.75, 39.15),
+    "philadelphia": ("Philadelphia", -75.45, 39.75, -74.90, 40.20),
+    "miami": ("Miami", -80.50, 25.55, -80.05, 26.35),
+    "phoenix": ("Phoenix", -112.45, 33.20, -111.60, 33.75),
 }
+# --zoom shorthands; metros ranked by 2023 MSA population
+ZOOM_GROUPS = {
+    "top10_metros": ["nyc", "los_angeles", "chicago", "dfw", "houston", "atlanta",
+                     "washington_dc", "philadelphia", "miami", "phoenix"],
+}
+# --states shorthand: 48 contiguous states + DC
+CONUS = [s for s in STATE_FIPS if s not in ("02", "15")]
+LARGE_MAP_BGS = 60_000  # above this many BGs the overview panel drops BG outlines (unreadable)
 PROFILE_COLS = [
     "population", "pop_density_per_sqkm", "median_hh_income", "median_age",
     "race_nh_white_share", "race_nh_black_share", "race_hispanic_share", "race_nh_asian_share",
@@ -103,29 +120,39 @@ def regional_matrix(z: pd.DataFrame, meta: pd.DataFrame, scale: str,
     return x * w
 
 
-def land_mask(states: list[str]):
-    """Shoreline-clipped land area of `states` (Census cartographic county boundaries, 1:500k)."""
+@lru_cache(maxsize=1)
+def _cb_counties() -> gpd.GeoDataFrame:
     zp = _download(CB_COUNTY_URL, RAW / "geography" / "cb_2023_us_county_500k.zip")
-    c = gpd.read_file(f"zip://{zp}", columns=["STATEFP"])
-    return c[c["STATEFP"].isin(states)].to_crs(5070).union_all()
+    return gpd.read_file(f"zip://{zp}", columns=["STATEFP"]).to_crs(5070)
+
+
+@lru_cache(maxsize=None)
+def land_mask(states: tuple[str, ...]):
+    """Shoreline-clipped land area of `states` (Census cartographic county boundaries, 1:500k)."""
+    c = _cb_counties()
+    return c[c["STATEFP"].isin(states)].union_all()
 
 
 def load_bg_shapes(states: list[str]) -> gpd.GeoDataFrame:
     """Every TIGER 2023 land block group in `states` (incl. ones never clustered), clipped to
     the shoreline: TIGER/Line BG polygons include their water area (the Farallon Islands BG
-    covers 248 km2 of ocean for 0.4 km2 of land), which drew BGs across bays and straits."""
+    covers 248 km2 of ocean for 0.4 km2 of land), which drew BGs across bays and straits.
+    Only BGs with water (AWATER > 0) are clipped, one state at a time, which keeps a
+    national run tractable."""
     frames = []
     for st in states:
         zp = RAW / "geography" / f"tl_2023_{st}_bg.zip"
         with zipfile.ZipFile(zp) as zf:
             shp = next(n for n in zf.namelist() if n.endswith(".shp"))
-        frames.append(gpd.read_file(f"zip://{zp}!{shp}", columns=["GEOID", "ALAND"]))
-    g = pd.concat(frames, ignore_index=True)
-    g = g[g["ALAND"] > 0].drop(columns="ALAND").to_crs(5070)
-    clipped = gpd.clip(g, land_mask(states), keep_geom_type=True)
-    clipped = clipped[~clipped.geometry.is_empty]
-    # tiny islands the generalized 1:500k shoreline misses keep their TIGER shape
-    return pd.concat([clipped, g[~g["GEOID"].isin(clipped["GEOID"])]], ignore_index=True)
+        g = gpd.read_file(f"zip://{zp}!{shp}", columns=["GEOID", "ALAND", "AWATER"])
+        g = g[g["ALAND"] > 0].to_crs(5070)
+        wet = g[g["AWATER"] > 0]
+        clipped = gpd.clip(wet, land_mask((st,)), keep_geom_type=True)
+        clipped = clipped[~clipped.geometry.is_empty]
+        # tiny islands the generalized 1:500k shoreline misses keep their TIGER shape
+        keep = g[(g["AWATER"] == 0) | ~g["GEOID"].isin(clipped["GEOID"])]
+        frames += [keep, clipped]
+    return pd.concat(frames, ignore_index=True).drop(columns=["ALAND", "AWATER"])
 
 
 def zoom_extent(name: str) -> tuple[str, float, float, float, float]:
@@ -143,10 +170,24 @@ def densest_extent(g: gpd.GeoDataFrame, cluster: int, pad: float = 15_000):
     return f"densest cluster ({cluster}) area", x0 - pad, x1 + pad, y0 - pad, y1 + pad
 
 
-def plot_map(g: gpd.GeoDataFrame, colors: dict, title: str, zooms: list, path) -> None:
-    fig, axes = plt.subplots(1, 1 + len(zooms), figsize=(10 * (1 + len(zooms)), 10))
-    ax, zaxes = axes[0], axes[1:]
-    g.plot(ax=ax, color=g["color"], edgecolor=EDGE_COLOR, linewidth=0.05)
+def plot_map(g: gpd.GeoDataFrame, colors: dict, title: str, zooms: list, path,
+             zoom_cols: int = 5) -> None:
+    """Overview + zoom panels: one row for up to 2 zooms, else the overview on top and the
+    zooms in a grid of `zoom_cols` columns below it."""
+    if len(zooms) <= 2:
+        fig, axes = plt.subplots(1, 1 + len(zooms), figsize=(10 * (1 + len(zooms)), 10))
+        ax, zaxes = axes[0], list(axes[1:])
+    else:
+        x0, y0, x1, y1 = g.total_bounds
+        width, zrows = 5 * zoom_cols, -(-len(zooms) // zoom_cols)
+        main_h = width * (y1 - y0) / (x1 - x0)
+        fig = plt.figure(figsize=(width, main_h + 1.5 + 5.3 * zrows))
+        gs = fig.add_gridspec(1 + zrows, zoom_cols, height_ratios=[main_h + 1.5] + [5.3] * zrows)
+        ax = fig.add_subplot(gs[0, :])
+        zaxes = [fig.add_subplot(gs[1 + i // zoom_cols, i % zoom_cols]) for i in range(len(zooms))]
+    axes = [ax, *zaxes]
+    lw = 0 if len(g) > LARGE_MAP_BGS else 0.05
+    g.plot(ax=ax, color=g["color"], edgecolor=EDGE_COLOR, linewidth=lw)
     handles = [Patch(facecolor=col, label=str(c)) for c, col in colors.items()]
     ax.legend(handles=handles, title="cluster", loc="upper center", bbox_to_anchor=(0.5, 0.0),
               ncol=min(len(handles), 8), frameon=False)
@@ -162,17 +203,18 @@ def plot_map(g: gpd.GeoDataFrame, colors: dict, title: str, zooms: list, path) -
     plt.close(fig)
 
 
-def plot_by_cluster(g: gpd.GeoDataFrame, colors: dict, pop_share: pd.Series, path,
-                    ncols: int = 5) -> None:
-    """Small multiples: one panel per cluster, that cluster dark on light gray."""
+def plot_by_cluster(g: gpd.GeoDataFrame, colors: dict, pop_share: pd.Series, states: list[str],
+                    path, ncols: int = 5) -> None:
+    """Small multiples: one panel per cluster, that cluster dark on the light-gray land area."""
     k = len(colors)
     nrows = -(-k // ncols)
     x0, y0, x1, y1 = g.total_bounds
     aspect = (y1 - y0) / (x1 - x0)  # panel height follows the region's shape
     fig, axes = plt.subplots(nrows, ncols, figsize=(4 * ncols, (4 * aspect + 0.4) * nrows))
+    land = gpd.GeoSeries([land_mask(tuple(states))], crs=g.crs)
     for ax, (c, col) in zip(axes.flat, colors.items()):
-        g.plot(ax=ax, color=np.where(g["cluster"] == c, HIGHLIGHT_COLOR, BACKGROUND_COLOR),
-               linewidth=0)
+        land.plot(ax=ax, color=BACKGROUND_COLOR, linewidth=0)
+        g[g["cluster"] == c].plot(ax=ax, color=HIGHLIGHT_COLOR, linewidth=0)
         ax.set_title(f"Cluster {c} · {pop_share[c]:.1%} of population", loc="left", x=0.09,
                      fontsize=11)
         # swatch = this cluster's color on map.png
@@ -187,14 +229,21 @@ def plot_by_cluster(g: gpd.GeoDataFrame, colors: dict, pop_share: pd.Series, pat
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--states", nargs="+", required=True, help="2-digit state FIPS codes")
+    ap.add_argument("--states", nargs="+", required=True,
+                    help="2-digit state FIPS codes, or 'conus' (48 contiguous states + DC)")
     ap.add_argument("--k", type=int, default=5)
     ap.add_argument("--scale", choices=["regional", "national"], default="regional")
     ap.add_argument("--seed", type=int, default=0)
-    ap.add_argument("--zoom", nargs="+", choices=list(ZOOMS), default=None,
+    ap.add_argument("--zoom", nargs="+", choices=[*ZOOMS, *ZOOM_GROUPS], default=None,
                     help="zoom panels to draw (default: around the densest cluster)")
     ap.add_argument("--out", default=None, help="output folder (default outputs/cluster_<states>_k<k>)")
     args = ap.parse_args()
+    region = "contiguous US" if args.states == ["conus"] else None
+    if region:
+        args.states = CONUS
+    region = region or f"states {', '.join(args.states)}"
+    if args.zoom:
+        args.zoom = [z for name in args.zoom for z in ZOOM_GROUPS.get(name, [name])]
 
     z = pd.read_parquet(PROCESSED / "features_standardized.parquet")
     meta = pd.read_csv(PROCESSED / "feature_metadata.csv")
@@ -215,7 +264,8 @@ def main():
     sil = silhouette_score(X.values[idx], labels.values[idx])
     print(f"silhouette (20k sample): {sil:.3f}")
 
-    tag = f"cluster_{'-'.join(args.states)}_k{args.k}" + ("" if args.scale == "regional" else "_national")
+    states_tag = "conus" if args.states == CONUS else "-".join(args.states)
+    tag = f"cluster_{states_tag}_k{args.k}" + ("" if args.scale == "regional" else "_national")
     out = Path(args.out) if args.out else ROOT / "outputs" / tag
     out.mkdir(parents=True, exist_ok=True)
     labels.to_frame().assign(state=labels.index.str[:2]).to_csv(out / "assignments.csv")
@@ -225,7 +275,7 @@ def main():
     prof.insert(0, "n_block_groups", labels.value_counts().sort_index())
     prof.insert(1, "population", r.groupby("cluster")["population"].sum())
     prof.insert(2, "pct_of_population", (prof["population"] / prof["population"].sum()).round(3))
-    for st in args.states:
+    for st in args.states if len(args.states) <= 8 else []:  # per-state shares only for small runs
         prof[f"share_bgs_in_{st}"] = labels[labels.index.str[:2] == st].value_counts().reindex(prof.index, fill_value=0) / prof["n_block_groups"]
     prof.T.to_csv(out / "profile.csv")
 
@@ -244,10 +294,10 @@ def main():
         zooms = [zoom_extent(z) for z in args.zoom]
     else:
         zooms = [densest_extent(g, prof["pop_density_per_sqkm"].idxmax())]
-    plot_map(g, colors, f"Block-group clusters (k={args.k}) — states {', '.join(args.states)}",
-             zooms, out / "map.png")
+    plot_map(g, colors, f"Block-group clusters (k={args.k}) — {region}", zooms, out / "map.png")
     if args.k > 7:
-        plot_by_cluster(g, colors, prof["pct_of_population"], out / "map_by_cluster.png")
+        plot_by_cluster(g, colors, prof["pct_of_population"], args.states,
+                        out / "map_by_cluster.png")
     print(f"wrote {out}")
     with pd.option_context("display.width", 200, "display.max_columns", 20):
         print(prof.T.round(3))

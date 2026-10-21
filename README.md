@@ -52,8 +52,10 @@ python cluster.py --states 06 --k 15 --zoom bay_area los_angeles --out examples/
 ```
 Writes `assignments.csv`, `profile.csv` (per-cluster medians), `centroids_z.csv` and `map.png`
 (BGs not clustered in gray) to `outputs/cluster_<states>_k<k>/` or `--out`. The map has one
-zoom panel per `--zoom` region (`nyc`, `chicago`, `bay_area`, `los_angeles`, `houston`, `dfw`;
-add more in `cluster.ZOOMS`), or one around the densest cluster by default. Block-group shapes
+zoom panel per `--zoom` region (`nyc`, `chicago`, `bay_area`, `los_angeles`, `houston`, `dfw`,
+`atlanta`, `washington_dc`, `philadelphia`, `miami`, `phoenix`, or the group `top10_metros`;
+add more in `cluster.ZOOMS`), or one around the densest cluster by default. `--states conus`
+selects the 48 contiguous states + DC. Block-group shapes
 are clipped to the shoreline (Census 1:500k county boundaries, downloaded once), because
 TIGER/Line block groups include their water area and would otherwise reach across bays. Clusters 1-7 use the
 colorblind-safe Okabe-Ito colors; no palette keeps more than about 7 categories reliably
@@ -63,6 +65,29 @@ By default features are re-standardized within the selected states (`--scale reg
 ## Examples
 
 Each folder in `examples/` holds the full outputs of one run.
+
+### Contiguous US, k = 15 (zooms: 10 largest metro areas)
+
+`examples/conus_k15/` - 48 states + DC, 235,304 block groups, silhouette 0.082. Zoom panels:
+New York, Los Angeles, Chicago, Dallas-Fort Worth, Houston, Atlanta, Washington, Philadelphia,
+Miami and Phoenix (largest metro areas by 2023 population).
+
+![Contiguous US example, k=15](examples/conus_k15/map.png)
+![Contiguous US clusters one at a time](examples/conus_k15/map_by_cluster.png)
+
+Some patterns, from `profile.csv` (medians per cluster):
+- Rural areas split mostly by location: cluster 2 (Northern Plains, Midwest, Northeast) and
+  cluster 3 (South and interior West), each under 30 people/km².
+- Suburbs split by income and region: clusters 5 ($148k) and 6 ($131k, mostly West) vs.
+  cluster 1 ($109k).
+- Mostly Hispanic neighborhoods form clusters 9 (69% Hispanic, mostly owners) and 14
+  (71%, mostly renters); mostly Black neighborhoods form 10 (53%) and 13 (58%, lower income).
+- Cluster 15 is dense high-rise neighborhoods (19,000 people/km², 51% of homes in 20+ unit
+  buildings, 37-minute median commute): 74% of its block groups are in New York, the rest
+  mainly in Boston, Chicago and Washington.
+```
+python cluster.py --states conus --k 15 --zoom top10_metros --out examples/conus_k15   # ~11 min
+```
 
 ### New York metro (NY, NJ, CT), k = 5
 
