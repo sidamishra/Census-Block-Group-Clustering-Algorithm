@@ -4,3 +4,5 @@ __pycache__/
 *.pyc
 # clustering outputs (worked examples live in examples/)
 outputs/
+# local cluster analyses (describe_clusters.py and its outputs)
+cluster_analysis/
